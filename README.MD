@@ -499,30 +499,7 @@ Cache entries are stored as serialized JSON strings and are automatically invali
 ## 📊 Dashboard & Monitoring
 
 The **Nexus Core Dashboard** (`Main.java`) provides real-time visibility into the running engine. All rendering is done with Java2D — no external libraries.
-
-```
-┌─ ⬡ DARKLAND NEXUS ─────────────────────── UP 00:14:32 | ● ONLINE | 14:22:07 ─┐
-│                                                                                 │
-│  ┌─ CPU LOAD ─┐  ┌─ PROCESS RAM ┐  ┌─ CACHE OBJECTS ┐  ┌─ ACTIVE ADDONS ─┐   │
-│  │   ◎ 2.4%   │  │   ◎ 128MB   │  │     ◎ 1,204    │  │      ◎  3       │   │
-│  └────────────┘  └─────────────┘  └────────────────┘  └─────────────────┘   │
-│                                                                                 │
-│  ┌─ CPU HISTORY — 60s ────────────┐  ┌─ RAM HISTORY — 60s ──────────────────┐ │
-│  │ ▁▂▁▁▂▃▂▁▁▂▁▁▁▂▂▁ ···         │  │ ▄▄▄▄▄▄▄▅▄▄▄▄▄▄▄▄ ···                │ │
-│  └────────────────────────────────┘  └──────────────────────────────────────┘ │
-│                                                                                 │
-│  ● ● ●  SYSTEM LOG  //  NEXUS OUTPUT STREAM                          LIVE      │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │    1  [14:08:02.441] ⬡ [BOOT]  Darkland Nexus v1.0 starting up...      │  │
-│  │    2  [14:08:02.443] ⬡ [BOOT]  Loading kernel modules...               │  │
-│  │    3  [14:08:02.451] ✓ [OK]    NetworkStack module ready               │  │
-│  │    4  [14:08:02.452] ✓ [OK]    CacheEngine module ready                │  │
-│  │    5  [14:08:03.120] ✓ [OK]    Redis connected → 127.0.0.1            │  │
-│  │    6  [14:08:03.341] ✓ [OK]    MongoDB connected → localhost:27017     │  │
-│  │    7  [14:08:03.342] ⬡ [BOOT]  Registered 3 addons                    │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
+![Project Screenshot](src/main/resources/nexus-core.png)
 
 ### Dashboard Metrics
 
