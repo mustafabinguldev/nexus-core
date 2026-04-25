@@ -2,142 +2,242 @@ package network.darkland.redis;
 
 import network.darkland.NexusApplication;
 import network.darkland.model.DataModel;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
- * Veri Senkronizasyon Merkezi
- * 1000+ veride işlemciyi yormaması için tüm ağır döngüler processTask üzerinden işlenir.
+ * ════════════════════════════════════════════════════════════
+ *  Veri Senkronizasyon Merkezi — RedisDataContainer
+ * ════════════════════════════════════════════════════════════
+ *
+ * Katman hiyerarşisi (üstten alta öncelik):
+ *
+ *   ┌─────────────────────────────────┐
+ *   │        Redis Cache (MASTER)     │  ← Tek doğru kaynak
+ *   └────────────┬──────────┬─────────┘
+ *                │          │
+ *         pull 10s       flush 15s
+ *                │          │
+ *   ┌────────────▼──┐  ┌────▼──────────────┐
+ *   │  L1 Cache     │  │     MongoDB        │
+ *   │  (in-memory)  │  │  (persistent DB)   │
+ *   └───────────────┘  └────────────────────┘
+ *
+ * Görev zamanlamaları:
+ *   L1 Sync        →  10s   Redis değiştiyse L1'i günceller
+ *   Auto Flush     →  15s   dirty key'leri Redis'ten Mongo'ya yazar
+ *   Reconciliation →   3dk  Mongo ≠ Redis ise Redis doğruyu yazar
+ *
+ * Temel garantiler:
+ *   • Redis her zaman master'dır; hiçbir görev Redis'i dışarıdan ezamaz.
+ *   • dirtyKeys.remove(key) Mongo yazımı başarıyla tamamlandıktan SONRA yapılır.
+ *     Hata durumunda key dirty listede kalır; bir sonraki flush'ta tekrar denenir.
+ *   • removeModel() atomik — TOCTOU race yoktur.
+ *   • Reconciliation Mongo'ya batch atarak 1000+ veride istek patlaması yaratmaz.
+ *   • getDataModelFromId() O(1) — reverse index ile arama yapılır.
+ * ════════════════════════════════════════════════════════════
  */
 public class RedisDataContainer {
 
-    private final ConcurrentHashMap<String, DataModel> idToDataList;
+    private static final Logger LOGGER = Logger.getLogger(RedisDataContainer.class.getName());
+
+    private static final int RECONCILE_BATCH_SIZE = 50;
+
+    private final ConcurrentHashMap<String, DataModel> keyToModel;
+
+    private final ConcurrentHashMap<String, String> idToKey;
+
     private final Set<String> dirtyKeys;
 
     public RedisDataContainer() {
-        this.idToDataList = new ConcurrentHashMap<>();
-        this.dirtyKeys = ConcurrentHashMap.newKeySet();
+        this.keyToModel = new ConcurrentHashMap<>();
+        this.idToKey    = new ConcurrentHashMap<>();
+        this.dirtyKeys  = ConcurrentHashMap.newKeySet();
 
         RedisManager rm = NexusApplication.getApplication().getRedisManager();
-        rm.scheduleTask(this::startAutoSyncTask, 30, 30, TimeUnit.SECONDS);
-        rm.scheduleTask(this::startL1SyncTask, 45, 45, TimeUnit.SECONDS);
-        rm.scheduleTask(this::startReconciliationTask, 5, 5, TimeUnit.MINUTES);
+        rm.scheduleTask(this::startL1SyncTask,         10, 10, TimeUnit.SECONDS);
+        rm.scheduleTask(this::startAutoFlushTask,      15, 15, TimeUnit.SECONDS);
+        rm.scheduleTask(this::startReconciliationTask,  3,  3, TimeUnit.MINUTES);
     }
 
     private void startL1SyncTask() {
+        if (keyToModel.isEmpty()) return;
 
-        System.out.println("l1 sync");
-        if (idToDataList.isEmpty()) return;
+        RedisManager rm = NexusApplication.getApplication().getRedisManager();
 
-        RedisManager redisManager = NexusApplication.getApplication().getRedisManager();
+        rm.processTask(() -> keyToModel.forEach((key, model) -> {
+            if (dirtyKeys.contains(key)) return;
 
-        redisManager.processTask(() -> {
-            idToDataList.forEach((key, model) -> {
-                if (dirtyKeys.contains(key)) return;
+            Optional<String> redisOpt = rm.getData(key);
 
-                redisManager.getData(key).ifPresent(redisJson -> {
-                    if (!redisJson.equals(model.getValueJson())) {
-                        model.setValueJson(redisJson);
-                    }
-                });
-            });
-        });
+            if (redisOpt.isPresent()) {
+                String redisJson = redisOpt.get();
+                if (!redisJson.equals(model.getValueJson())) {
+                    model.setValueJson(redisJson);
+                }
+            } else {
+                LOGGER.warning("[L1Sync] Redis key kayıp, restore ediliyor: " + key);
+                rm.setData(key, model.getValueJson());
+                dirtyKeys.add(key);
+            }
+        }));
     }
 
-    private void startAutoSyncTask() {
-
-        System.out.println("Auto save");
+    private void startAutoFlushTask() {
         if (dirtyKeys.isEmpty()) return;
-        List<String> keysToSync = new ArrayList<>(dirtyKeys);
-        dirtyKeys.removeAll(keysToSync);
 
-        RedisManager redisManager = NexusApplication.getApplication().getRedisManager();
+        List<String> keysToFlush = new ArrayList<>(dirtyKeys);
 
-        redisManager.processTask(() -> {
-            for (String key : keysToSync) {
-                DataModel model = idToDataList.get(key);
-                if (model != null) {
+        RedisManager rm = NexusApplication.getApplication().getRedisManager();
+
+        rm.processTask(() -> {
+            for (String key : keysToFlush) {
+                DataModel model = keyToModel.get(key);
+                if (model == null) {
+                    dirtyKeys.remove(key);
+                    continue;
+                }
+
+                String jsonToWrite = rm.getData(key).orElseGet(model::getValueJson);
+
+                try {
                     NexusApplication.getApplication().getMongoManager()
-                            .setValue(model.getAddon(), model.getSpecificDbKey(), model.getValueJson());
+                            .setValue(model.getAddon(), model.getSpecificDbKey(), jsonToWrite)
+                            .get();
+
+                    dirtyKeys.remove(key);
+
+                } catch (Exception e) {
+                    LOGGER.log(Level.SEVERE,
+                            "[AutoFlush] Mongo yazımı başarısız, tekrar denenecek: " + key, e);
                 }
             }
         });
     }
 
     private void startReconciliationTask() {
+        if (keyToModel.isEmpty()) return;
 
+        RedisManager rm = NexusApplication.getApplication().getRedisManager();
 
-        if (idToDataList.isEmpty()) return;
+        rm.processTask(() -> {
+            List<String> keys  = new ArrayList<>(keyToModel.keySet());
+            List<CompletableFuture<?>> batch = new ArrayList<>(RECONCILE_BATCH_SIZE);
 
+            for (String key : keys) {
+                // dirty key → flush henüz tamamlanmadı; dokunma
+                if (dirtyKeys.contains(key)) continue;
 
-        System.out.println("reconcl sync");
+                DataModel model = keyToModel.get(key);
+                if (model == null) continue;
 
-        RedisManager redisManager = NexusApplication.getApplication().getRedisManager();
+                String redisJson = rm.getData(key).orElseGet(model::getValueJson);
 
-        redisManager.processTask(() -> {
-            idToDataList.forEach((keyTag, model) -> {
-                if (dirtyKeys.contains(keyTag)) return;
-
-                NexusApplication.getApplication().getMongoManager().getValue(model.getAddon(), model.getSpecificDbKey())
+                CompletableFuture<?> future = NexusApplication.getApplication()
+                        .getMongoManager()
+                        .getValue(model.getAddon(), model.getSpecificDbKey())
                         .thenAccept(dbJson -> {
-                            if (dbJson == null) return;
+                            if (dbJson == null) {
+                                // Mongo'da kayıt yok → Redis'tekini yaz
+                                NexusApplication.getApplication().getMongoManager()
+                                        .setValue(model.getAddon(), model.getSpecificDbKey(), redisJson);
+                                return;
+                            }
                             try {
                                 String cleanDbJson = model.getAddon().modelInitComp(dbJson);
-                                if (!cleanDbJson.equals(model.getValueJson())) {
-                                    model.setValueJson(cleanDbJson);
-                                    redisManager.setData(keyTag, cleanDbJson);
+                                if (!cleanDbJson.equals(redisJson)) {
+                                    NexusApplication.getApplication().getMongoManager()
+                                            .setValue(model.getAddon(), model.getSpecificDbKey(), redisJson);
+                                    model.setValueJson(redisJson);
                                 }
                             } catch (Exception e) {
-                                e.printStackTrace();
+                                LOGGER.log(Level.WARNING,
+                                        "[Reconciliation] modelInitComp hatası: " + key, e);
                             }
+                        })
+                        .exceptionally(ex -> {
+                            LOGGER.log(Level.WARNING,
+                                    "[Reconciliation] Mongo okuma hatası: " + key, ex);
+                            return null;
                         });
-            });
+
+                batch.add(future);
+
+                if (batch.size() >= RECONCILE_BATCH_SIZE) {
+                    waitForBatch(batch);
+                    batch.clear();
+                }
+            }
+
+            if (!batch.isEmpty()) waitForBatch(batch);
         });
     }
 
+    private void waitForBatch(List<CompletableFuture<?>> batch) {
+        try {
+            CompletableFuture.allOf(batch.toArray(new CompletableFuture[0])).get();
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "[Reconciliation] Batch bekleme hatası", e);
+        }
+    }
+
     public void addModel(String key, DataModel model) {
-        updateInternal(key, model);
+        writeToL1AndRedis(key, model);
         dirtyKeys.add(key);
     }
 
     public void addModelFix(String key, DataModel model) {
-        idToDataList.put(key, model);
+        writeToL1AndRedis(key, model);
         dirtyKeys.add(key);
     }
 
-    public void removeModel(String key) {
-        if (idToDataList.containsKey(key)) {
-            dirtyKeys.remove(key);
-            idToDataList.remove(key);
-            NexusApplication.getApplication().getRedisManager().deleteData(key);
-        }
-    }
-
     public void addModelDirect(String key, DataModel model) {
-        updateInternal(key, model);
+        writeToL1AndRedis(key, model);
         NexusApplication.getApplication().getRedisManager().processTask(() -> {
-            NexusApplication.getApplication().getMongoManager()
-                    .setValue(model.getAddon(), model.getSpecificDbKey(), model.getValueJson());
+            try {
+                NexusApplication.getApplication().getMongoManager()
+                        .setValue(model.getAddon(), model.getSpecificDbKey(), model.getValueJson())
+                        .get();
+            } catch (Exception e) {
+                LOGGER.log(Level.SEVERE,
+                        "[addModelDirect] Mongo yazımı başarısız: " + key, e);
+            }
         });
     }
 
-    private void updateInternal(String key, DataModel model) {
-        idToDataList.put(key, model);
-        NexusApplication.getApplication().getRedisManager().setData(key, model.getValueJson());
+    public void removeModel(String key) {
+        DataModel removed = keyToModel.remove(key);
+        if (removed == null) return;  // zaten yoktu
+
+        idToKey.remove(removed.getId());
+        dirtyKeys.remove(key);
+        NexusApplication.getApplication().getRedisManager().deleteData(key);
     }
 
     public Optional<DataModel> getDataModelFromId(String id) {
-        return idToDataList.values().stream().filter(dm -> dm.getId().equals(id)).findAny();
+        String key = idToKey.get(id);
+        if (key == null) return Optional.empty();
+        return Optional.ofNullable(keyToModel.get(key));
     }
 
     public Optional<DataModel> getDataModelFromKey(String key) {
-        return Optional.ofNullable(idToDataList.get(key));
+        return Optional.ofNullable(keyToModel.get(key));
     }
 
     public Set<String> getDirtyKeys() { return dirtyKeys; }
-    public int getDataSize() { return this.idToDataList.size(); }
+    public int getDataSize()          { return keyToModel.size(); }
+
+    private void writeToL1AndRedis(String key, DataModel model) {
+        keyToModel.put(key, model);
+        idToKey.put(model.getId(), key);
+        NexusApplication.getApplication().getRedisManager().setData(key, model.getValueJson());
+    }
 }
