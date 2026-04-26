@@ -1,7 +1,9 @@
 package network.darkland.redis;
 
+import net.bytebuddy.dynamic.Nexus;
 import network.darkland.NexusApplication;
 import network.darkland.model.DataModel;
+import network.darkland.protocol.NexusJsonDataContainer;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -66,7 +68,25 @@ public class RedisDataContainer {
         rm.scheduleTask(this::startL1SyncTask,         10, 10, TimeUnit.SECONDS);
         rm.scheduleTask(this::startAutoFlushTask,      15, 15, TimeUnit.SECONDS);
         rm.scheduleTask(this::startReconciliationTask,  3,  3, TimeUnit.MINUTES);
+
+        rm.scheduleTask(this::sendNetworkLiveBroadcast, 1, 1, TimeUnit.SECONDS);
+
     }
+
+    private void sendNetworkLiveBroadcast() {
+
+        NexusApplication.getApplication().getRedisManager().processTask(() -> {
+            NexusJsonDataContainer jsonDataContainer = new NexusJsonDataContainer();
+            jsonDataContainer.set("type","LIVE");
+            jsonDataContainer.set("source", "nexus");
+            jsonDataContainer.set("time", System.currentTimeMillis() / 1000L);
+
+
+            NexusApplication.getApplication().getRedisManager().publish("darkland_nexus_live", jsonDataContainer.toFullJson());
+        });
+
+    }
+
 
     private void startL1SyncTask() {
         if (keyToModel.isEmpty()) return;

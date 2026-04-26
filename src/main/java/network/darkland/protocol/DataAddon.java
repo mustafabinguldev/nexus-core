@@ -31,16 +31,22 @@ public abstract class DataAddon {
     private volatile Class<?> cachedIdClass = null;
     private final Object idCacheLock = new Object();
 
+
     private volatile Field[] cachedAnnotatedFields = null;
     private final Object fieldCacheLock = new Object();
 
     private final ConcurrentHashMap<String, Object> keyLocks = new ConcurrentHashMap<>();
 
     public abstract boolean handleRequest(String source, RequestType type, NexusJsonDataContainer json);
+
     public abstract int addonId();
+
     public abstract String addonName();
+
     public abstract String cacheKeyHeaderTag();
+
     public abstract String getDatabase();
+
     public abstract String getCollection();
 
     public void loadIntoCache(Object key) {
@@ -55,6 +61,7 @@ public abstract class DataAddon {
         NexusJsonDataContainer triggerContainer = new NexusJsonDataContainer();
         triggerContainer.set(getIdFieldName(), key);
         getData(triggerContainer);
+
     }
 
     public void handleIncrementData(String source, NexusJsonDataContainer json) {
@@ -75,7 +82,6 @@ public abstract class DataAddon {
                 }
 
                 json.set(getIdFieldName(), keyValue);
-
                 Object lock = keyLocks.computeIfAbsent(keyValue.toString(), k -> new Object());
                 synchronized (lock) {
                     Optional<DataModel> dataModelOpt = getData(json);
@@ -375,6 +381,6 @@ public abstract class DataAddon {
     }
 
     public enum RequestType {
-        SET_DATA, GET_DATA, UPDATE_DATA, REMOVE_DATA, BROADCAST, LOAD_CACHE, INCREMENT_DATA
+        SET_DATA, GET_DATA, UPDATE_DATA, REMOVE_DATA, BROADCAST, LOAD_CACHE, INCREMENT_DATA, LIVE
     }
 }
